@@ -2,15 +2,28 @@
 Jupytur — Jupyter kernel backed by a live Urbit ship.
 
 Each kernel instance opens one persistent Eyre channel, subscribes to a
-dedicated Dojo session (/sole/~ship/session-name), and drives it via
-%eval-command pokes.  Results arrive as %sole-effect SSE events on that
-channel and are collected until the session emits %pro (the prompt), which
-signals that the command has finished.
+dedicated %sole session (/sole/~ship/session-name) on a chosen agent, and
+drives it via %eval-command pokes.  Results arrive as %sole-effect SSE events
+on that channel and are collected until the session emits %pro (the prompt),
+which signals that the command has finished.
 
 Required environment variables:
-  JUPYTUR_URL   HTTP URL of the ship, e.g. http://localhost:8080
-  JUPYTUR_CODE  Web login code (get with +code in Dojo)
-  JUPYTUR_SHIP  Ship name without ~, e.g. zod or sampel-palnet
+  JUPYTUR_URL    HTTP URL of the ship, e.g. http://localhost:8080
+  JUPYTUR_CODE   Web login code (get with +code in Dojo)
+  JUPYTUR_SHIP   Ship name without ~, e.g. zod or sampel-palnet
+
+Optional environment variables:
+  JUPYTUR_AGENT  Gall agent to connect to (default: dojo).
+                 Any agent built with /lib/shoe or /app/dojo qualifies.
+  JUPYTUR_SESSION
+                 Session name to use (default: auto-generated from PID).
+                 Must be a valid @ta cord.
+
+Magic commands (run in a notebook cell):
+  %sessions              list sessions open on the current agent
+  %sessions <agent>      list sessions open on a different agent
+  %connect <agent> <session>
+                         switch to a different agent / session
 """
 
 import json
@@ -52,11 +65,14 @@ class JupyturKernel(Kernel):
         url = os.environ.get("JUPYTUR_URL", "http://localhost:8080").rstrip("/")
         code = os.environ.get("JUPYTUR_CODE", "")
         ship = os.environ.get("JUPYTUR_SHIP", "zod")
+        agent = os.environ.get("JUPYTUR_AGENT", "dojo")
+        session = os.environ.get("JUPYTUR_SESSION", f"jupyter-{os.getpid()}")
 
         self._url = url
         self._ship = ship
         self._channel = f"jupytur-{os.getpid()}"
-        self._session = f"jupyter-{os.getpid()}"
+        self._agent = agent
+        self._session = session
         self._sub_id = None
 
         self._http = requests.Session()
@@ -66,7 +82,7 @@ class JupyturKernel(Kernel):
         t = threading.Thread(target=self._sse_reader, daemon=True)
         t.start()
 
-        # Subscribing to /sole creates the Dojo session; the first event is %pro.
+        # Subscribing to /sole creates the session; the first event is %pro.
         self._subscribe()
         self._collect_until_pro(timeout=15)
 
@@ -102,9 +118,22 @@ class JupyturKernel(Kernel):
             "id": sid,
             "action": "subscribe",
             "ship": self._ship,
-            "app": "dojo",
+            "app": self._agent,
             "path": f"/sole/~{self._ship}/{self._session}",
         }])
+
+    def _unsubscribe(self):
+        if self._sub_id is None:
+            return
+        try:
+            self._put([{
+                "id": self._next_id(),
+                "action": "unsubscribe",
+                "subscription": self._sub_id,
+            }])
+        except Exception:
+            pass
+        self._sub_id = None
 
     def _ack(self, event_id):
         self._put([{
@@ -118,10 +147,22 @@ class JupyturKernel(Kernel):
             "id": self._next_id(),
             "action": "poke",
             "ship": self._ship,
-            "app": "dojo",
+            "app": self._agent,
             "mark": "eval-command",
             "json": {"ses": self._session, "src": src},
         }])
+
+    def _scry_sessions(self, agent):
+        """Return the list of active session name strings for an agent."""
+        r = self._http.get(
+            f"{self._url}/~/scry/{agent}/sole/sessions.json",
+        )
+        r.raise_for_status()
+        data = r.json()
+        # The scry returns a JSON array of @ta cord strings.
+        if isinstance(data, list):
+            return data
+        return []
 
     # ------------------------------------------------------------------ SSE reader
 
@@ -156,7 +197,7 @@ class JupyturKernel(Kernel):
 
         Sole-effect JSON shapes (from mar/sole/effect.hoon grow/json):
           {"tan": "string"}     — rendered tang output (result or runtime error)
-          {"txt": "string"}     — plain text line
+          {"txt": "string"}     — plain text line (shoe agents use this)
           {"pro": {...}}        — command complete (prompt)
           {"hop": N}            — parse error at character N (%err)
           {"act": "bel"|...}    — %bel, %nex, %clr, %bye (ignore)
@@ -230,11 +271,88 @@ class JupyturKernel(Kernel):
                 # If the poke itself was rejected, stop waiting.
                 if data.get("ok") is False:
                     err_msg = data.get("err", "poke failed (unknown reason)")
-                    lines.append(f"dojo: {err_msg}")
+                    lines.append(f"{self._agent}: {err_msg}")
                     had_error = True
                     break
 
         return "\n".join(lines), had_error
+
+    # ------------------------------------------------------------------ magic commands
+
+    def _handle_magic(self, code):
+        """Handle %magic commands entered in notebook cells."""
+        parts = code.strip().split()
+        cmd = parts[0].lower()
+
+        if cmd == "%sessions":
+            agent = parts[1] if len(parts) > 1 else self._agent
+            try:
+                sessions = self._scry_sessions(agent)
+                label = "" if not sessions else "\n".join(f"  {s or '$'}" for s in sessions)
+                text = f"Agent {agent!r} — active sessions:\n{label or '  (none)'}\n"
+                text += f"\nCurrent: agent={self._agent!r} session={self._session!r}\n"
+            except Exception as e:
+                text = f"Error querying {agent!r}: {e}\n"
+            self.send_response(
+                self.iopub_socket, "stream", {"name": "stdout", "text": text}
+            )
+            return {
+                "status": "ok",
+                "execution_count": self.execution_count,
+                "payload": [],
+                "user_expressions": {},
+            }
+
+        if cmd == "%connect":
+            if len(parts) < 3:
+                self.send_response(
+                    self.iopub_socket,
+                    "stream",
+                    {"name": "stderr", "text": "Usage: %connect <agent> <session>\n"},
+                )
+                return {
+                    "status": "error",
+                    "execution_count": self.execution_count,
+                    "ename": "UsageError",
+                    "evalue": "Usage: %connect <agent> <session>",
+                    "traceback": [],
+                }
+            new_agent, new_session = parts[1], parts[2]
+            self._unsubscribe()
+            self._agent = new_agent
+            self._session = new_session
+            self._subscribe()
+            _, had_error = self._collect_until_pro(timeout=15)
+            if had_error:
+                text = f"Warning: connection to {new_agent!r}/{new_session!r} returned an error.\n"
+                self.send_response(
+                    self.iopub_socket, "stream", {"name": "stderr", "text": text}
+                )
+            else:
+                text = f"Connected: agent={new_agent!r} session={new_session!r}\n"
+                self.send_response(
+                    self.iopub_socket, "stream", {"name": "stdout", "text": text}
+                )
+            return {
+                "status": "ok",
+                "execution_count": self.execution_count,
+                "payload": [],
+                "user_expressions": {},
+            }
+
+        # Unknown magic command — pass through as a parse error hint.
+        self.send_response(
+            self.iopub_socket,
+            "stream",
+            {"name": "stderr", "text": f"Unknown magic command: {cmd}\n"},
+        )
+        return {
+            "status": "error",
+            "execution_count": self.execution_count,
+            "ename": "UsageError",
+            "evalue": f"Unknown magic command: {cmd}",
+            "traceback": [],
+        }
 
     # ------------------------------------------------------------------ Jupyter protocol
 
@@ -255,6 +373,9 @@ class JupyturKernel(Kernel):
                 "user_expressions": {},
             }
 
+        if code.startswith("%"):
+            return self._handle_magic(code)
+
         self._eval(code)
         output, had_error = self._collect_until_pro()
 
@@ -270,7 +391,7 @@ class JupyturKernel(Kernel):
                 self.send_response(
                     self.iopub_socket,
                     "stream",
-                    {"name": "stderr", "text": "dojo: parse error\n"},
+                    {"name": "stderr", "text": f"{self._agent}: parse error\n"},
                 )
 
         if had_error:
@@ -279,7 +400,7 @@ class JupyturKernel(Kernel):
                 "execution_count": self.execution_count,
                 "ename": "HoonError",
                 "evalue": output or "parse error",
-                "traceback": [output or "dojo: parse error"],
+                "traceback": [output or f"{self._agent}: parse error"],
             }
 
         return {
@@ -291,20 +412,12 @@ class JupyturKernel(Kernel):
 
     def do_is_complete(self, code):
         # Hoon has tall/wide form; full completeness detection requires the
-        # Dojo parser.  Return 'complete' and let the user manage multi-line
+        # agent's parser.  Return 'complete' and let the user manage multi-line
         # input via cell continuation.
         return {"status": "complete"}
 
     def do_shutdown(self, restart):
-        try:
-            if self._sub_id is not None:
-                self._put([{
-                    "id": self._next_id(),
-                    "action": "unsubscribe",
-                    "subscription": self._sub_id,
-                }])
-        except Exception:
-            pass
+        self._unsubscribe()
         return {"status": "ok", "restart": restart}
 
 
