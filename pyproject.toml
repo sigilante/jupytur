@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jupytur"
+version = "0.1.0"
+description = "Jupyter kernel backed by a live Urbit ship (Hoon REPL)"
+requires-python = ">=3.9"
+dependencies = [
+    "ipykernel>=6.0",
+    "requests>=2.28",
+]
+
+[project.scripts]
+jupytur-install = "jupytur.install:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jupytur*"]
+
+[tool.setuptools.package-data]
+jupytur = ["kernelspec/kernel.json"]

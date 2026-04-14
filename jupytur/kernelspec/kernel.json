@@ -1,0 +1,30 @@
+{
+    "argv": [
+        "python",
+        "-m",
+        "jupytur.kernel",
+        "-f",
+        "{connection_file}"
+    ],
+    "display_name": "Jupytur (Hoon)",
+    "language": "hoon",
+    "interrupt_mode": "signal",
+    "env": {},
+    "metadata": {
+        "debugger": false,
+        "description": "Hoon REPL kernel backed by a live Urbit ship via Eyre",
+        "author": "N. E. Davis",
+        "license": "MIT",
+        "url": "https://github.com/sigilante/jupytur",
+        "help_links": [
+            {
+                "text": "Hoon School",
+                "url": "https://developers.urbit.org/courses/hoon-school"
+            },
+            {
+                "text": "Hoon Reference",
+                "url": "https://developers.urbit.org/reference/hoon/overview"
+            }
+        ]
+    }
+}
