@@ -19,5 +19,3 @@ jupytur-install = "jupytur.install:main"
 where = ["."]
 include = ["jupytur*"]
 
-[tool.setuptools.package-data]
-jupytur = ["kernelspec/kernel.json"]
