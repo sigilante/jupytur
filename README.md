@@ -106,6 +106,36 @@ and reconnects — useful for switching agents or pointing at a different
 ship.  Note that Jupyter sets syntax highlighting at kernel-launch time;
 swapping the agent via `%config` does not switch the highlighter.
 
+### 3. `%sessions` — list active sessions
+
+```
+%sessions
+```
+
+Scries `/x/sole/sessions` ([urbit/urbit#7379](https://github.com/urbit/urbit/pull/7379),
+not yet merged) on the current agent and prints every session opened
+there, e.g. from other notebooks or crashed kernels that never
+unsubscribed. On connect the kernel also runs this check itself: if the
+session name it's about to use (default is PID-based, so collisions
+across machines are possible) is already on the list, it picks a
+different one automatically rather than sharing a vector clock with
+whoever is already there.
+
+Two caveats:
+
+- **`%dojo` doesn't support this.** `on-peek` in `pkg/arvo/app/dojo.hoon`
+  is a hand-rolled stub that never delegates to `/lib/shoe`, so it has
+  nothing to report regardless of #7379 — the "Jupytur (Hoon)" kernel's
+  default agent just silently gets no collision protection and an
+  "unavailable" `%sessions`. This only does anything against a real
+  `/lib/shoe`-built agent, e.g. `%north`, or a custom shoe agent. Ships
+  running a `shoe.hoon` older than #7379 degrade the same way.
+- **The list isn't "currently open."** Unless an agent's `+shoe` core
+  overrides `on-leave` to prune `soles`, a session that unsubscribed
+  cleanly still shows up here — shoe's default `on-leave` doesn't clean
+  it up. Read `%sessions` as "has been used on this agent," not "is
+  live right now."
+
 ### 2. Environment variables (shared across notebooks)
 
 ```sh

@@ -34,6 +34,27 @@ Configuration:
   If JUPYTUR_SHIP and JUPYTUR_CODE are set in the environment the kernel
   auto-connects at boot. Otherwise it waits for a %config cell — the first
   code cell will error with a hint until the kernel is connected.
+
+Session discovery:
+  On connect, the kernel scries /x/sole/sessions (urbit/urbit#7379) to
+  check whether the chosen session name is already live on the agent,
+  and picks a fresh one instead of colliding with it. This matters
+  because the default session name is PID-based, and PIDs are only
+  unique per machine. A %sessions cell lists everything currently live
+  on the agent.
+
+  This only works against agents that actually route through
+  /lib/shoe's on-peek wrapper (e.g. %north, or a custom shoe agent) —
+  %dojo's on-peek (pkg/arvo/app/dojo.hoon) is a hand-rolled stub that
+  never delegates to shoe, so it has no session data to give regardless
+  of #7379. Against %dojo (or any ship predating #7379), the scry comes
+  back empty-handed and the kernel just skips the check silently — no
+  error, no collision protection either.
+
+  Also: on agents that don't override shoe's default on-leave (the
+  example /app/shoe.hoon included), a session that unsubscribed cleanly
+  still shows up in this list — shoe's default on-leave doesn't prune
+  `soles`. Treat %sessions as "has been used," not "is currently open."
 """
 
 import json
@@ -236,6 +257,7 @@ class JupyturKernel(Kernel):
                 " (set via %config or JUPYTUR_SHIP / JUPYTUR_CODE env)"
             )
         self._login(self._code)
+        self._avoid_session_collision()
         try:
             while True:
                 self._q.get_nowait()
@@ -262,6 +284,54 @@ class JupyturKernel(Kernel):
             allow_redirects=False,
         )
         r.raise_for_status()
+
+    def _scry_sessions(self):
+        """List sole sessions ever opened on the current agent.
+
+        Reads /x/sole/sessions (urbit/urbit#7379, not yet merged). Any
+        non-200 — 404/500 for a ship predating #7379, or for an agent
+        like %dojo whose on-peek doesn't route through shoe at all — is
+        treated as "unknown", not an error, since this is an optional
+        nicety the kernel doesn't depend on to function.
+        """
+        try:
+            r = self._http.get(
+                f"{self._url}/~/scry/{self._agent}/sole/sessions.json",
+                timeout=5,
+            )
+        except requests.RequestException:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            entries = r.json()
+        except ValueError:
+            return None
+        return {(e["ship"], e["session"]) for e in entries}
+
+    def _avoid_session_collision(self):
+        """Rename self._session if it's already live on this agent.
+
+        JUPYTUR_SESSION defaults to a PID-based name, and PIDs are only
+        unique per machine — two notebooks on two different hosts (or
+        containers) can easily pick the same name and end up sharing one
+        sole vector-clock on the ship. Sidestep that by checking first.
+        """
+        sessions = self._scry_sessions()
+        if sessions is None:
+            return
+        want = (f"~{self._ship}", self._session)
+        if want not in sessions:
+            return
+        original = self._session
+        suffix = 2
+        while (f"~{self._ship}", f"{original}-{suffix}") in sessions:
+            suffix += 1
+        self._session = f"{original}-{suffix}"
+        sys.stderr.write(
+            f"jupytur: session '{original}' already active on "
+            f"~{self._ship}/%{self._agent}; using '{self._session}' instead\n"
+        )
 
     # ------------------------------------------------------------------ ids
 
@@ -529,6 +599,39 @@ class JupyturKernel(Kernel):
         )
         return self._magic_ok()
 
+    def _handle_sessions(self):
+        """%sessions — list active sole sessions on the current agent.
+
+        Surfaces urbit/urbit#7379's /x/sole/sessions scry directly, so
+        users can see stale sessions from crashed kernels or collisions
+        with other notebooks/dojo without leaving the notebook.
+        """
+        sessions = self._scry_sessions()
+        if sessions is None:
+            text = (
+                f"session listing unavailable on ~{self._ship}/%{self._agent}"
+                " (needs urbit/urbit#7379, and an agent whose on-peek routes"
+                " through /lib/shoe — %dojo's does not)\n"
+            )
+            self.send_response(
+                self.iopub_socket, "stream", {"name": "stderr", "text": text}
+            )
+            return self._magic_ok()
+
+        mine = (f"~{self._ship}", self._session)
+        if not sessions:
+            text = f"no active sessions on ~{self._ship}/%{self._agent}\n"
+        else:
+            lines = [
+                f"  {ship}/{ses}" + ("  (this session)" if (ship, ses) == mine else "")
+                for ship, ses in sorted(sessions)
+            ]
+            text = f"active sessions on %{self._agent}:\n" + "\n".join(lines) + "\n"
+        self.send_response(
+            self.iopub_socket, "stream", {"name": "stdout", "text": text}
+        )
+        return self._magic_ok()
+
     def _magic_ok(self):
         return {
             "status": "ok",
@@ -565,6 +668,13 @@ class JupyturKernel(Kernel):
 
         if code.startswith("%config"):
             return self._handle_config(code[len("%config"):].strip())
+
+        if code.startswith("%sessions"):
+            if not self._connected:
+                return self._magic_error(
+                    "kernel is not connected. run %config first"
+                )
+            return self._handle_sessions()
 
         if not self._connected:
             hint = self._init_error or (
